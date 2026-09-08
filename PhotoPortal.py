@@ -1,4 +1,5 @@
 import os
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -26,6 +27,7 @@ mp_selfie_segmentation = mp.solutions.selfie_segmentation
 selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=0)
 
 executor = ThreadPoolExecutor(max_workers=1)
+segmentation_executor = ThreadPoolExecutor(max_workers=1)
 
 appdata_local = os.getenv('LOCALAPPDATA')
 if not appdata_local:
@@ -42,20 +44,120 @@ logging.basicConfig(
 logging.info('Программа запущена')
 
 root = None
-cap = None
 webcam_label = None
 webcam_after_id = None
 app_closing = False
 last_webcam_read_error_log_time = None
 WEBCAM_READ_ERROR_LOG_INTERVAL = 5.0
+PREVIEW_INTERVAL_MS = 36
+SEGMENTATION_INTERVAL = 0.1
+segmentation_future = None
+last_segmentation_submit = 0.0
+latest_segmentation_mask = None
+segmentation_generation = 0
+segmentation_lock = threading.Lock()
+mediapipe_lock = threading.Lock()
 BG = "#F5F5E6"
 SAVE_DIR = appdata_local
-ICO_DIR = "C:\Program Files\PhotoPortal\icon.ico"
+ICO_DIR = r"C:\Program Files\PhotoPortal\icon.ico"
 MIRROR_HORIZONTAL = False
 NUM_THREADS = 4
 MAX_THREADS = 4
 SENSITIVITY_THRESHOLD = 0.6
 BLUR_STRENGTH = 5.5
+
+
+class CameraManager:
+    """Owns camera discovery and the complete ``VideoCapture`` lifecycle."""
+
+    RESOLUTIONS = ((1920, 1080), (1280, 960), (1280, 720), (640, 480))
+
+    def __init__(self, capture_factory=None):
+        self._capture_factory = capture_factory or cv2.VideoCapture
+        self._capture = None
+        self._camera_id = None
+        self._resolution = None
+        self._lock = threading.RLock()
+
+    def discover(self, limit=10):
+        """Return camera descriptors without retaining any probe captures."""
+        logging.info("Поиск доступных камер")
+        cameras = []
+        for camera_id in range(limit):
+            probe = self._capture_factory(camera_id)
+            try:
+                if probe.isOpened():
+                    cameras.append({"id": camera_id, "name": f"Камера {camera_id}"})
+            finally:
+                probe.release()
+        logging.info("Доступные камеры: %s", cameras)
+        return cameras
+
+    def open(self, camera_id):
+        """Open a camera and select the first requested mode yielding a frame."""
+        with self._lock:
+            self.close()
+            capture = self._capture_factory(camera_id)
+            if not capture.isOpened():
+                capture.release()
+                logging.error("Не удалось открыть камеру %s", camera_id)
+                return False
+
+            for requested_width, requested_height in self.RESOLUTIONS:
+                capture.set(cv2.CAP_PROP_FRAME_WIDTH, requested_width)
+                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_height)
+                actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                ok, frame = capture.read()
+                if ok and frame is not None and getattr(frame, "size", 0):
+                    self._capture = capture
+                    self._camera_id = camera_id
+                    self._resolution = (actual_width, actual_height)
+                    logging.info(
+                        "Камера %s открыта: запрошено %sx%s, реально выбрано %sx%s",
+                        camera_id, requested_width, requested_height,
+                        actual_width, actual_height,
+                    )
+                    return True
+                logging.warning(
+                    "Камера %s не вернула кадр при %sx%s (фактически %sx%s)",
+                    camera_id, requested_width, requested_height,
+                    actual_width, actual_height,
+                )
+
+            capture.release()
+            logging.error("Камера %s не поддерживает ни один рабочий режим", camera_id)
+            return False
+
+    def switch(self, camera_id):
+        return self.open(camera_id)
+
+    def read(self):
+        with self._lock:
+            if self._capture is None or not self._capture.isOpened():
+                return False, None
+            ok, frame = self._capture.read()
+            return ok, frame
+
+    def is_open(self):
+        with self._lock:
+            return self._capture is not None and self._capture.isOpened()
+
+    def get_resolution(self):
+        with self._lock:
+            return self._resolution
+
+    def close(self):
+        with self._lock:
+            if self._capture is not None:
+                self._capture.release()
+                logging.info("Камера %s освобождена", self._camera_id)
+            self._capture = None
+            self._camera_id = None
+            self._resolution = None
+
+
+camera_manager = CameraManager()
 
 
 
@@ -308,15 +410,7 @@ def open_settings():
 
 def get_available_cameras():
     """Получение доступных камер"""
-    logging.info("Поиск доступных камер")
-    cameras = []
-    for i in range(10):
-        temp_cap = cv2.VideoCapture(i)
-        if temp_cap.isOpened():
-            cameras.append({"id": i, "name": f"Камера {i}"})
-            temp_cap.release()
-    logging.info(f"Доступные камеры: {cameras}")
-    return cameras
+    return camera_manager.discover()
 
 
 SAVE_DIR, camera_index, ICO_DIR, MIRROR_HORIZONTAL = load_settings()
@@ -324,18 +418,20 @@ SAVE_DIR, camera_index, ICO_DIR, MIRROR_HORIZONTAL = load_settings()
 
 def show_webcam():
     """Отображение изображения с камеры"""
-    global cap, webcam_label, MIRROR_HORIZONTAL, SENSITIVITY_THRESHOLD
+    global webcam_label, MIRROR_HORIZONTAL
     global webcam_after_id, last_webcam_read_error_log_time
+    global segmentation_future, last_segmentation_submit
+    global segmentation_generation
 
     # Запланированный callback уже начал выполняться, поэтому его ID больше
     # нельзя отменить через after_cancel().
     webcam_after_id = None
     if app_closing:
         return
-    if cap is None:
+    if not camera_manager.is_open():
         logging.warning("Камера не инициализирована")
         return
-    ret, frame = cap.read()
+    ret, frame = camera_manager.read()
     if not ret or frame is None:
         current_time = time.monotonic()
         if (last_webcam_read_error_log_time is None or
@@ -360,18 +456,29 @@ def show_webcam():
     if width > target_width:
         left = (width - target_width) // 2
         frame = frame[:, left:left + target_width]
-    frame_small = cv2.resize(frame, (320, 240))
-    frame_rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+    now = time.monotonic()
+    if (segmentation_future is None or segmentation_future.done()) and \
+            now - last_segmentation_submit >= SEGMENTATION_INTERVAL:
+        last_segmentation_submit = now
+        segmentation_future = segmentation_executor.submit(
+            analyse_preview_frame, frame.copy(), SENSITIVITY_THRESHOLD
+        )
+        generation = segmentation_generation
+        segmentation_future.add_done_callback(
+            lambda future, generation=generation:
+            store_segmentation_result(future, generation)
+        )
 
-    results = selfie_segmentation.process(frame_rgb)
-    mask = results.segmentation_mask > SENSITIVITY_THRESHOLD
-    mask = mask.astype(np.uint8) * 255
-    kernel = np.ones((3, 3), np.uint8)
-    mask_dilated = cv2.dilate(mask, kernel, iterations=1)
-    mask_eroded = cv2.erode(mask_dilated, kernel, iterations=1)
-    mask_smoothed = cv2.GaussianBlur(mask_eroded, (3, 3), sigmaX=1.5, sigmaY=1.5)
-    _, mask_smoothed = cv2.threshold(mask_smoothed, 127, 255, cv2.THRESH_BINARY)
-    frame_rgb[mask_smoothed == 0] = [255, 255, 255]
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    with segmentation_lock:
+        mask_smoothed = (None if latest_segmentation_mask is None
+                         else latest_segmentation_mask.copy())
+    if mask_smoothed is not None:
+        mask_smoothed = cv2.resize(
+            mask_smoothed, (frame_rgb.shape[1], frame_rgb.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        frame_rgb[mask_smoothed == 0] = [255, 255, 255]
 
     frame_rgb = cv2.resize(frame_rgb, (300, 400), interpolation=cv2.INTER_LANCZOS4)
     frame_pil = PILImage.fromarray(frame_rgb)
@@ -405,12 +512,42 @@ def schedule_webcam_update():
     """Планирует единственное следующее обновление изображения с камеры."""
     global webcam_after_id
     if not app_closing and webcam_label is not None:
-        webcam_after_id = webcam_label.after(33, show_webcam)
+        webcam_after_id = webcam_label.after(PREVIEW_INTERVAL_MS, show_webcam)
+
+
+def analyse_preview_frame(frame, sensitivity):
+    """Run preview segmentation in the sole MediaPipe preview worker."""
+    height, width = frame.shape[:2]
+    scale = min(240 / width, 320 / height)
+    scaled_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    scaled = cv2.resize(frame, scaled_size, interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
+    with mediapipe_lock:
+        results = selfie_segmentation.process(rgb)
+    mask = (results.segmentation_mask > sensitivity).astype(np.uint8) * 255
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.erode(mask, kernel, iterations=1)
+    mask = cv2.GaussianBlur(mask, (3, 3), sigmaX=1.5, sigmaY=1.5)
+    return cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)[1]
+
+
+def store_segmentation_result(future, generation):
+    """Replace, rather than enqueue, the latest worker result."""
+    global latest_segmentation_mask
+    try:
+        mask = future.result()
+    except Exception:
+        logging.exception("Ошибка сегментации preview")
+        return
+    with segmentation_lock:
+        if generation == segmentation_generation:
+            latest_segmentation_mask = mask
 
 
 def update_camera(index):
     """Подключение к камере"""
-    global cap, webcam_after_id
+    global webcam_after_id, latest_segmentation_mask, segmentation_generation
     logging.info(f"Переключение на камеру {index}")
     if webcam_after_id is not None:
         try:
@@ -420,24 +557,15 @@ def update_camera(index):
         finally:
             webcam_after_id = None
 
-    if cap is not None:
-        cap.release()
     if app_closing:
-        cap = None
+        camera_manager.close()
         return
-    cap = cv2.VideoCapture(index)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    if not cap.isOpened():
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 960)
-    if not cap.isOpened():
-        logging.error(f"Не удалось открыть камеру {index}")
+    with segmentation_lock:
+        segmentation_generation += 1
+        latest_segmentation_mask = None
+    if not camera_manager.switch(index):
         messagebox.showerror("Ошибка", "Не удалось открыть камеру")
-        cap = None
     else:
-        logging.info(
-            f"Камера {index} открыта с разрешением {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
         show_webcam()
 
 
@@ -466,7 +594,8 @@ def process_image(image_path, from_webcam=False):
         logging.info(f"Начало обработки изображения: {image_path}")
         input_image = PILImage.open(image_path).convert("RGB")
         image_np = np.array(input_image)
-        results = selfie_segmentation.process(image_np)
+        with mediapipe_lock:
+            results = selfie_segmentation.process(image_np)
         mask = results.segmentation_mask > SENSITIVITY_THRESHOLD
         mask = mask.astype(np.uint8) * 255
         kernel = np.ones((3, 3), np.uint8)
@@ -563,7 +692,8 @@ def adjust_brightness(image, from_webcam=False):
     rgb_original = original_np[:, :, :3]
     alpha = original_np[:, :, 3] if image.mode == "RGBA" else None
 
-    results = selfie_segmentation.process(rgb_original)
+    with mediapipe_lock:
+        results = selfie_segmentation.process(rgb_original)
     cached_mask = (results.segmentation_mask > SENSITIVITY_THRESHOLD).astype(np.uint8) * 255
 
     def update_preview(*args):
@@ -650,8 +780,8 @@ def capture_photo():
     """Захват кадра"""
     global MIRROR_HORIZONTAL
     logging.info("Начало съёмки фото")
-    if cap and cap.isOpened():
-        ret, frame = cap.read()
+    if camera_manager.is_open():
+        ret, frame = camera_manager.read()
         if not ret or frame is None:
             logging.error("Не удалось захватить кадр с камеры")
             messagebox.showerror("Ошибка", "Не удалось сделать фото")
@@ -1017,7 +1147,7 @@ def main():
 
 def shutdown_app():
     """Идемпотентно освобождает ресурсы и закрывает приложение."""
-    global app_closing, webcam_after_id, cap, selfie_segmentation
+    global app_closing, webcam_after_id, selfie_segmentation
 
     if app_closing:
         return
@@ -1046,14 +1176,19 @@ def shutdown_app():
         finally:
             delattr(debounce_update_sensitivity, 'debounce_id')
 
-    if cap is not None:
+    try:
+        camera_manager.close()
+    except Exception:
+        logging.exception("Не удалось освободить камеру")
+
+    # Дожидаемся уже выполняющейся сегментации до закрытия её MediaPipe-модели.
+    try:
         try:
-            cap.release()
-            logging.info("Камера освобождена")
-        except Exception:
-            logging.exception("Не удалось освободить камеру")
-        finally:
-            cap = None
+            segmentation_executor.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            segmentation_executor.shutdown(wait=True)
+    except Exception:
+        logging.exception("Не удалось завершить segmentation executor")
 
     if selfie_segmentation is not None:
         try:
