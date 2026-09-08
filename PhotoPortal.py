@@ -1,4 +1,5 @@
 import os
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -59,12 +60,60 @@ segmentation_lock = threading.Lock()
 mediapipe_lock = threading.Lock()
 BG = "#F5F5E6"
 SAVE_DIR = appdata_local
+TEMP_DIR = os.path.join(appdata_local, "PhotoPortal", "Temp")
 ICO_DIR = r"C:\Program Files\PhotoPortal\icon.ico"
 MIRROR_HORIZONTAL = False
 NUM_THREADS = 4
 MAX_THREADS = 4
 SENSITIVITY_THRESHOLD = 0.6
 BLUR_STRENGTH = 5.5
+
+
+def initialize_temp_directory():
+    """Create the private workspace and remove files left by earlier runs."""
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    for entry in os.scandir(TEMP_DIR):
+        try:
+            if entry.is_file(follow_symlinks=False):
+                os.remove(entry.path)
+                logging.info("Удалён устаревший временный файл: %s", entry.path)
+        except OSError:
+            logging.exception("Не удалось удалить временный файл: %s", entry.path)
+
+
+def create_temp_path(suffix=".jpg"):
+    """Reserve and return a unique path inside PhotoPortal's private workspace."""
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    temporary_file = tempfile.NamedTemporaryFile(
+        prefix="photoportal_", suffix=suffix, dir=TEMP_DIR, delete=False
+    )
+    temporary_file.close()
+    return temporary_file.name
+
+
+def remove_temp_file(path):
+    """Best-effort removal restricted to the application's private workspace."""
+    if not path:
+        return
+    temp_root = os.path.normcase(os.path.realpath(TEMP_DIR))
+    candidate = os.path.normcase(os.path.realpath(path))
+    try:
+        if os.path.commonpath((temp_root, candidate)) != temp_root:
+            logging.warning("Отказ от удаления файла вне временной папки: %s", path)
+            return
+    except ValueError:
+        logging.warning("Отказ от удаления файла на другом диске: %s", path)
+        return
+    try:
+        os.remove(path)
+        logging.info("Временный файл удалён: %s", path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logging.exception("Не удалось удалить временный файл: %s", path)
+
+
+initialize_temp_directory()
 
 
 class CameraManager:
@@ -678,9 +727,7 @@ def load_image():
                 if result == "retry":
                     load_image()
             finally:
-                if os.path.exists(cropped_path):
-                    os.remove(cropped_path)
-                    logging.info(f"Временный файл удален: {cropped_path}")
+                remove_temp_file(cropped_path)
 
 
 def process_image(image_path, from_webcam=False):
@@ -793,11 +840,14 @@ def save_image(image, result_window):
     index = 1
     while os.path.exists(save_path := os.path.join(SAVE_DIR, f"photo_{index}.jpg")):
         index += 1
-    image.save(save_path, "JPEG", quality=95, dpi=(300, 300))
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    staging_path = create_temp_path(".jpg")
+    try:
+        image.save(staging_path, "JPEG", quality=95, dpi=(300, 300))
+        os.replace(staging_path, save_path)
+    finally:
+        remove_temp_file(staging_path)
     logging.info(f"Изображение сохранено: {save_path}")
-    temp_path = os.path.join(SAVE_DIR, "webcam_photo.jpg")
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
 
     # Обновляем локальную статистику по дням
     update_local_daily_stats()
@@ -810,43 +860,61 @@ def save_image(image, result_window):
 
 
 def capture_photo():
-    """Захват кадра"""
+    """Capture one frame and return its unique private temporary path."""
     global MIRROR_HORIZONTAL
     logging.info("Начало съёмки фото")
-    if camera_manager.is_open():
-        ret, frame = camera_manager.read()
-        if not ret or frame is None:
-            logging.error("Не удалось захватить кадр с камеры")
-            messagebox.showerror("Ошибка", "Не удалось сделать фото")
-            return
-        if MIRROR_HORIZONTAL:
-            frame = cv2.flip(frame, 1)
-        if ret:
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            mean_brightness = np.mean(frame_gray)
-            if mean_brightness < 50:
-                frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=20)
-            elif mean_brightness > 200:
-                frame = cv2.convertScaleAbs(frame, alpha=0.9, beta=-20)
-
-            height, width = frame.shape[:2]
-            target_width = int(height * 3 / 4)
-            if width > target_width:
-                left = (width - target_width) // 2
-                frame = frame[:, left:left + target_width]
-            photo_path = os.path.join(SAVE_DIR, "webcam_photo.jpg")
-            cv2.imwrite(photo_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-            logging.info(f"Фото сохранено: {photo_path}")
-            result = process_image(photo_path, from_webcam=True)
-            if result == "retry":
-                return
-        else:
-            logging.error("Не удалось захватить кадр с камеры")
-            messagebox.showerror("Ошибка", "Не удалось сделать фото")
-    else:
+    if not camera_manager.is_open():
         logging.error("Камера недоступна")
         messagebox.showerror("Ошибка", "Камера недоступна")
+        return None
 
+    ret, frame = camera_manager.read()
+    if not ret or frame is None:
+        logging.error("Не удалось захватить кадр с камеры")
+        messagebox.showerror("Ошибка", "Не удалось сделать фото")
+        return None
+    if MIRROR_HORIZONTAL:
+        frame = cv2.flip(frame, 1)
+
+    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_brightness = np.mean(frame_gray)
+    if mean_brightness < 50:
+        frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=20)
+    elif mean_brightness > 200:
+        frame = cv2.convertScaleAbs(frame, alpha=0.9, beta=-20)
+
+    height, width = frame.shape[:2]
+    target_width = int(height * 3 / 4)
+    if width > target_width:
+        left = (width - target_width) // 2
+        frame = frame[:, left:left + target_width]
+
+    photo_path = create_temp_path(".jpg")
+    try:
+        if not cv2.imwrite(
+                photo_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 100]):
+            raise OSError("OpenCV не удалось записать снимок")
+    except Exception:
+        remove_temp_file(photo_path)
+        raise
+    logging.info("Снимок записан во временный файл: %s", photo_path)
+    return photo_path
+
+
+def capture_and_process_photo():
+    """Run capture and processing while always disposing of the source frame."""
+    photo_path = None
+    try:
+        photo_path = capture_photo()
+        if photo_path:
+            return process_image(photo_path, from_webcam=True)
+        return None
+    except Exception as error:
+        logging.exception("Ошибка записи или обработки снимка")
+        messagebox.showerror("Ошибка", f"Ошибка обработки: {error}")
+        return None
+    finally:
+        remove_temp_file(photo_path)
 
 def sync_network_stats():
     """Синхронизирует локальную статистику с сетевым файлом за последние 30 дней."""
@@ -1097,9 +1165,12 @@ def crop_interactively(image_path):
     logging.info(f"Координаты обрезки: {crop_coords}")
     final_image = original_image.crop(crop_coords)
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    temp_path = os.path.join(SAVE_DIR, f"cropped_temp_{timestamp}.jpg")
-    final_image.save(temp_path, "JPEG")
+    temp_path = create_temp_path(".jpg")
+    try:
+        final_image.save(temp_path, "JPEG")
+    except Exception:
+        remove_temp_file(temp_path)
+        raise
     logging.info(f"Обрезанное изображение для обработки сохранено: {temp_path}, размер: {final_image.size}")
     return temp_path
 
@@ -1148,7 +1219,7 @@ def main():
 
     update_camera(camera_index)
 
-    capture_button = tk.Button(root, text="Сделать фото", command=capture_photo,
+    capture_button = tk.Button(root, text="Сделать фото", command=capture_and_process_photo,
                                width=17, height=2, bg="#E04E39", fg="#FFFFFF",
                                font=("Arial", 16, "bold"), padx=10, pady=5, relief="flat",
                                activebackground="#623B2A")
