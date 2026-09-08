@@ -942,6 +942,7 @@ def main():
     app_closing = False
     logging.info("Запуск основного интерфейса")
     root = tk.Tk()
+    root.protocol("WM_DELETE_WINDOW", shutdown_app)
     logging.info("Главное окно Tkinter создано")
     root.title("Подготовка фото для портала Mos.ru")
     try:
@@ -957,7 +958,6 @@ def main():
     root.geometry("800x750")
     root.resizable(False, False)
     root.configure(bg="#F5F5E6")
-    root.protocol("WM_DELETE_WINDOW", close_application)
     logging.info("Параметры окна установлены")
 
     webcam_frame = tk.Frame(root, bd=1, bg="#C39367")
@@ -1012,26 +1012,72 @@ def main():
     try:
         root.mainloop()
     finally:
-        close_application(destroy_root=False)
+        shutdown_app()
 
 
-def close_application(destroy_root=True):
-    """Останавливает callback камеры и освобождает её перед завершением."""
-    global app_closing, webcam_after_id, cap
+def shutdown_app():
+    """Идемпотентно освобождает ресурсы и закрывает приложение."""
+    global app_closing, webcam_after_id, cap, selfie_segmentation
+
+    if app_closing:
+        return
     app_closing = True
-    if webcam_after_id is not None and webcam_label is not None:
+
+    if webcam_after_id is not None:
         try:
-            webcam_label.after_cancel(webcam_after_id)
+            callback_owner = webcam_label if webcam_label is not None else root
+            if callback_owner is not None:
+                callback_owner.after_cancel(webcam_after_id)
         except tk.TclError:
             logging.debug("Callback камеры уже был удалён при завершении")
+        except Exception:
+            logging.exception("Не удалось отменить callback камеры")
         finally:
             webcam_after_id = None
+
+    debounce_id = getattr(debounce_update_sensitivity, 'debounce_id', None)
+    if debounce_id is not None:
+        try:
+            root.after_cancel(debounce_id)
+        except tk.TclError:
+            logging.debug("Debounce callback уже был удалён при завершении")
+        except Exception:
+            logging.exception("Не удалось отменить debounce callback")
+        finally:
+            delattr(debounce_update_sensitivity, 'debounce_id')
+
     if cap is not None:
-        cap.release()
-        cap = None
-        logging.info("Камера освобождена")
-    if destroy_root and root is not None:
-        root.destroy()
+        try:
+            cap.release()
+            logging.info("Камера освобождена")
+        except Exception:
+            logging.exception("Не удалось освободить камеру")
+        finally:
+            cap = None
+
+    if selfie_segmentation is not None:
+        try:
+            selfie_segmentation.close()
+        except Exception:
+            logging.exception("Не удалось закрыть MediaPipe SelfieSegmentation")
+        finally:
+            selfie_segmentation = None
+
+    try:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+    except Exception:
+        logging.exception("Не удалось завершить работу executor")
+
+    if root is not None:
+        try:
+            root.destroy()
+        except tk.TclError:
+            logging.debug("Главное окно уже было закрыто")
+        except Exception:
+            logging.exception("Не удалось закрыть главное окно")
 
 
 
@@ -1051,4 +1097,8 @@ def update_sensitivity(value):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logging.exception("Аварийное завершение PhotoPortal")
+        shutdown_app()
