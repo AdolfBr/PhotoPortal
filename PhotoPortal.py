@@ -157,6 +157,102 @@ class CameraManager:
             self._resolution = None
 
 
+class ImageProcessor:
+    """RGB-only image processing with a reusable MediaPipe segmentation mask."""
+
+    def __init__(self, segmentation_model=None, sensitivity=SENSITIVITY_THRESHOLD):
+        self.segmentation_model = segmentation_model or selfie_segmentation
+        self.sensitivity = float(sensitivity)
+        self._source_rgb = None
+        self._segmentation_mask = None
+
+    @staticmethod
+    def _as_rgb_array(image):
+        if isinstance(image, PILImage.Image):
+            array = np.asarray(image.convert("RGB"))
+        else:
+            array = np.asarray(image)
+            if array.ndim != 3 or array.shape[2] < 3:
+                raise ValueError("Ожидается RGB-изображение")
+            array = array[:, :, :3]
+        return np.clip(array, 0, 255).astype(np.uint8)
+
+    def segment(self, image):
+        """Run MediaPipe once and cache its continuous float mask."""
+        rgb = self._as_rgb_array(image)
+        with mediapipe_lock:
+            result = self.segmentation_model.process(rgb)
+        mask = np.asarray(result.segmentation_mask, dtype=np.float32)
+        if mask.shape != rgb.shape[:2]:
+            mask = cv2.resize(mask, (rgb.shape[1], rgb.shape[0]),
+                              interpolation=cv2.INTER_LINEAR)
+        self._source_rgb = rgb.copy()
+        self._segmentation_mask = np.clip(mask, 0.0, 1.0)
+        return self._segmentation_mask.copy()
+
+    def _soft_mask(self, softness):
+        if self._segmentation_mask is None:
+            raise ValueError("Сначала необходимо выполнить сегментацию")
+        softness = max(0.0, float(softness))
+        mask = self._segmentation_mask
+        if softness:
+            kernel_size = max(3, int(softness * 4) | 1)
+            mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size),
+                                    sigmaX=softness * 2,
+                                    sigmaY=softness * 2)
+        # Deliberately keep the alpha continuous: no final binary threshold.
+        return np.clip(mask, 0.0, 1.0)
+
+    def remove_background(self, image=None, softness=BLUR_STRENGTH):
+        """Composite the foreground over white and return an uint8 RGB image."""
+        if image is not None:
+            rgb = self._as_rgb_array(image)
+            if self._segmentation_mask is None or rgb.shape != self._source_rgb.shape:
+                self.segment(rgb)
+            else:
+                self._source_rgb = rgb.copy()
+        elif self._source_rgb is None:
+            raise ValueError("Изображение не задано")
+
+        mask = self._soft_mask(softness)[..., None]
+        foreground = self._source_rgb.astype(np.float32)
+        white_background = np.full_like(foreground, 255.0)
+        composed = foreground * mask + white_background * (1.0 - mask)
+        return PILImage.fromarray(np.clip(composed, 0, 255).astype(np.uint8), "RGB")
+
+    def adjust_brightness(self, brightness=0, softness=BLUR_STRENGTH,
+                          image=None):
+        """Adjust cached source RGB and composite with the cached soft mask."""
+        if image is not None and self._segmentation_mask is None:
+            self.segment(image)
+        if self._source_rgb is None:
+            raise ValueError("Изображение не задано")
+        foreground = np.clip(
+            self._source_rgb.astype(np.float32) + float(brightness), 0, 255
+        )
+        mask = self._soft_mask(softness)[..., None]
+        white_background = np.full_like(foreground, 255.0)
+        composed = foreground * mask + white_background * (1.0 - mask)
+        return PILImage.fromarray(np.clip(composed, 0, 255).astype(np.uint8), "RGB")
+
+    def resize(self, image, min_width=600, min_height=800):
+        """Enlarge an RGB image just enough to meet the requested dimensions."""
+        rgb_image = PILImage.fromarray(self._as_rgb_array(image), "RGB")
+        width, height = rgb_image.size
+        if width >= min_width and height >= min_height:
+            return rgb_image
+        ratio = max(min_width / width, min_height / height)
+        size = (int(width * ratio), int(height * ratio))
+        return rgb_image.resize(size, PILImage.Resampling.BICUBIC).convert("RGB")
+
+    def prepare_final(self, image, brightness=0, softness=BLUR_STRENGTH,
+                      min_width=600, min_height=800):
+        """Segment once, composite, adjust brightness and produce final RGB."""
+        self.segment(image)
+        composed = self.adjust_brightness(brightness, softness)
+        return self.resize(composed, min_width, min_height)
+
+
 camera_manager = CameraManager()
 
 
@@ -593,56 +689,16 @@ def process_image(image_path, from_webcam=False):
     try:
         logging.info(f"Начало обработки изображения: {image_path}")
         input_image = PILImage.open(image_path).convert("RGB")
-        image_np = np.array(input_image)
-        with mediapipe_lock:
-            results = selfie_segmentation.process(image_np)
-        mask = results.segmentation_mask > SENSITIVITY_THRESHOLD
-        mask = mask.astype(np.uint8) * 255
-        kernel = np.ones((3, 3), np.uint8)
-        mask_dilated = cv2.dilate(mask, kernel, iterations=1)
-        mask_eroded = cv2.erode(mask_dilated, kernel, iterations=1)
-        mask_smoothed = cv2.GaussianBlur(mask_eroded, (3, 3), sigmaX=1.5, sigmaY=1.5)
-        _, mask_smoothed = cv2.threshold(mask_smoothed, 127, 255, cv2.THRESH_BINARY)
-        rgb = image_np.copy()
-        alpha = mask_smoothed
-        rgb[alpha == 0] = [255, 255, 255]
-        output_image = PILImage.fromarray(np.dstack((rgb, alpha)))
-        enhanced_image = enhance_image(output_image)
-        final_image = ensure_min_size(enhanced_image, min_width=600, min_height=800)
-        return adjust_brightness(final_image)
+        processor = ImageProcessor(sensitivity=SENSITIVITY_THRESHOLD)
+        processor.segment(input_image)
+        return adjust_brightness(processor, from_webcam=from_webcam)
     except Exception as e:
         logging.error(f"Ошибка обработки изображения: {e}")
         messagebox.showerror("Ошибка", f"Ошибка обработки: {e}")
         return None
 
 
-def enhance_image(image):
-    """Улучшение результата"""
-    logging.info("Улучшение качества изображения")
-    image_np = np.array(image.convert("RGB"))
-    enhanced = np.clip(image_np, 0, 255).astype(np.uint8)
-    enhanced_pil = PILImage.fromarray(enhanced)
-    if image.mode == "RGBA":
-        alpha = image.split()[3]
-        enhanced_pil.putalpha(alpha)
-    return enhanced_pil
-
-
-def ensure_min_size(image, min_width=600, min_height=800):
-    """Увелечение до минимального размера"""
-    logging.info("Проверка размера изображения")
-    width, height = image.size
-    if width < min_width or height < min_height:
-        ratio = max(min_width / width, min_height / height)
-        new_width, new_height = int(width * ratio), int(height * ratio)
-        resized = image.resize((new_width, new_height), PILImage.Resampling.BICUBIC)
-        logging.info(f"Изображение увеличено до {new_width}x{new_height}")
-        return resized
-    logging.info(f"Размер изображения сохранен: {width}x{height}")
-    return image
-
-
-def adjust_brightness(image, from_webcam=False):
+def adjust_brightness(processor, from_webcam=False):
     """Настройка яркости результата"""
     global SENSITIVITY_THRESHOLD, BLUR_STRENGTH
     logging.info("Открытие окна корректировки яркости и сглаживания")
@@ -660,7 +716,8 @@ def adjust_brightness(image, from_webcam=False):
 
     image_frame = tk.Frame(brightness_window, bd=1, bg="#C39367")
     image_frame.pack(pady=10)
-    thumbnail = image.copy()
+    initial_image = processor.adjust_brightness(0, BLUR_STRENGTH)
+    thumbnail = initial_image.copy()
     thumbnail.thumbnail((300, 400))
     img_tk = ImageTk.PhotoImage(thumbnail)
     label = tk.Label(image_frame, image=img_tk, bg="#FFFFFF")
@@ -687,32 +744,12 @@ def adjust_brightness(image, from_webcam=False):
     Tooltip(blur_slider,
             "Настройте, насколько плавно края объекта переходят в фон. Сдвиньте вправо для более мягкого перехода.")
 
-    adjusted_image = [image]
-    original_np = np.array(image)
-    rgb_original = original_np[:, :, :3]
-    alpha = original_np[:, :, 3] if image.mode == "RGBA" else None
-
-    with mediapipe_lock:
-        results = selfie_segmentation.process(rgb_original)
-    cached_mask = (results.segmentation_mask > SENSITIVITY_THRESHOLD).astype(np.uint8) * 255
+    adjusted_image = [initial_image]
 
     def update_preview(*args):
         brightness = brightness_value.get()
         blur_strength = blur_value.get()
-        rgb = rgb_original.copy()
-
-        if blur_strength > 0:
-            kernel_size = max(3, int(blur_strength * 4) | 1)
-            sigma = blur_strength * 2
-            mask_blurred = cv2.GaussianBlur(cached_mask, (kernel_size, kernel_size), sigmaX=sigma)
-            _, mask_blurred = cv2.threshold(mask_blurred, 127, 255, cv2.THRESH_BINARY)
-            rgb[mask_blurred == 0] = [255, 255, 255]
-        else:
-            rgb[cached_mask == 0] = [255, 255, 255]
-
-        adjusted_rgb = np.clip(rgb.astype(float) + brightness, 0, 255).astype(np.uint8)
-        adjusted_image[0] = PILImage.fromarray(
-            np.dstack((adjusted_rgb, alpha))) if alpha is not None else PILImage.fromarray(adjusted_rgb)
+        adjusted_image[0] = processor.adjust_brightness(brightness, blur_strength)
 
         thumbnail = adjusted_image[0].copy()
         thumbnail.thumbnail((300, 400))
@@ -723,13 +760,8 @@ def adjust_brightness(image, from_webcam=False):
     result = [None]
 
     def save():
-        white_bg = PILImage.new("RGBA", adjusted_image[0].size, (255, 255, 255, 255))
-        if adjusted_image[0].mode == "RGBA":
-            white_bg.paste(adjusted_image[0], (0, 0), adjusted_image[0].split()[3])
-        else:
-            white_bg.paste(adjusted_image[0], (0, 0))
-        white_bg = white_bg.convert("RGB")
-        save_image(white_bg, brightness_window)
+        final_image = processor.resize(adjusted_image[0], 600, 800)
+        save_image(final_image, brightness_window)
         result[0] = "saved"
 
     def retry():
