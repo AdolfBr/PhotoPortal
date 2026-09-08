@@ -15,7 +15,7 @@ try:
     import multiprocessing
     import numpy as np
     import mediapipe as mp
-    from PIL import Image as PILImage, ImageTk, ImageDraw, ImageFont
+    from PIL import Image as PILImage, ImageTk, ImageDraw, ImageFont, ImageOps
     from concurrent.futures import ThreadPoolExecutor
     from datetime import datetime, timedelta
 except ImportError as e:
@@ -688,7 +688,8 @@ def process_image(image_path, from_webcam=False):
     global SENSITIVITY_THRESHOLD
     try:
         logging.info(f"Начало обработки изображения: {image_path}")
-        input_image = PILImage.open(image_path).convert("RGB")
+        with PILImage.open(image_path) as image:
+            input_image = ImageOps.exif_transpose(image).convert("RGB")
         processor = ImageProcessor(sensitivity=SENSITIVITY_THRESHOLD)
         processor.segment(input_image)
         return adjust_brightness(processor, from_webcam=from_webcam)
@@ -946,6 +947,31 @@ def update_local_daily_stats():
     logging.info(f"Локальная статистика обновлена: {today}, {stats[today]}")
 
 
+def calculate_crop_rectangle(image_size, zoom, offset_x, offset_y,
+                             canvas_size=(300, 400)):
+    """Map the canvas viewport to one bounded, integer 3:4 source rectangle."""
+    image_width, image_height = image_size
+    canvas_width, canvas_height = canvas_size
+    if zoom <= 0:
+        raise ValueError("zoom must be positive")
+
+    # Express the largest exact 3:4 rectangle that fits in the viewport.  Using
+    # one common unit prevents independent rounding from changing the ratio.
+    ratio_unit = int(min(canvas_width / (3 * zoom),
+                         canvas_height / (4 * zoom)) + 1e-9)
+    if ratio_unit < 1:
+        raise ValueError("zoom is too large to produce an integer 3:4 crop")
+    crop_width, crop_height = 3 * ratio_unit, 4 * ratio_unit
+
+    viewport_left = -offset_x / zoom
+    viewport_top = -offset_y / zoom
+    left = round(viewport_left + (canvas_width / zoom - crop_width) / 2)
+    top = round(viewport_top + (canvas_height / zoom - crop_height) / 2)
+    left = max(0, min(left, image_width - crop_width))
+    top = max(0, min(top, image_height - crop_height))
+    return left, top, left + crop_width, top + crop_height
+
+
 def crop_interactively(image_path):
     logging.info(f"Открытие окна кадрирования для: {image_path}")
     crop_window = tk.Toplevel()
@@ -956,35 +982,33 @@ def crop_interactively(image_path):
     crop_window.attributes('-topmost', True)
 
     display_width, display_height = 300, 400
-    original_image = PILImage.open(image_path).convert("RGB")
+    with PILImage.open(image_path) as image:
+        original_image = ImageOps.exif_transpose(image).convert("RGB")
     orig_width, orig_height = original_image.size
-    target_ratio = 3 / 4
-    current_ratio = orig_width / orig_height
-    if current_ratio > target_ratio:
-        actual_height = orig_height
-        actual_width = int(actual_height * target_ratio)
-    else:
-        actual_width = orig_width
-        actual_height = int(actual_width / target_ratio)
-
-    display_scale = display_width / actual_width
-    scale_factor = 1.0
-    img_display = original_image.copy()
-    img_display_resized = img_display.resize((int(original_image.width * scale_factor * display_scale),
-                                              int(original_image.height * scale_factor * display_scale)),
-                                             PILImage.Resampling.LANCZOS)
+    min_zoom = max(display_width / orig_width, display_height / orig_height)
+    zoom = min_zoom
+    offset_x = (display_width - orig_width * zoom) / 2
+    offset_y = (display_height - orig_height * zoom) / 2
+    img_display_resized = original_image.resize(
+        (round(orig_width * zoom), round(orig_height * zoom)),
+        PILImage.Resampling.LANCZOS,
+    )
     img_tk = ImageTk.PhotoImage(img_display_resized)
 
     canvas_frame = tk.Frame(crop_window, bg="#C39367", bd=1)
     canvas_frame.pack(pady=10)
     canvas = tk.Canvas(canvas_frame, width=display_width, height=display_height, bg="#FFFFFF")
     canvas.pack()
-    image_id = canvas.create_image(display_width // 2, display_height // 2, image=img_tk)
+    image_id = canvas.create_image(offset_x, offset_y, image=img_tk, anchor="nw")
     canvas.image = img_tk
 
     dragging = False
     start_x, start_y = 0, 0
-    img_x, img_y = display_width // 2, display_height // 2
+
+    def constrain_offsets():
+        nonlocal offset_x, offset_y
+        offset_x = max(display_width - orig_width * zoom, min(0, offset_x))
+        offset_y = max(display_height - orig_height * zoom, min(0, offset_y))
 
     def start_drag(event):
         nonlocal dragging, start_x, start_y
@@ -992,13 +1016,14 @@ def crop_interactively(image_path):
         start_x, start_y = event.x, event.y
 
     def drag(event):
-        nonlocal img_x, img_y, start_x, start_y
+        nonlocal offset_x, offset_y, start_x, start_y
         if dragging:
             dx = event.x - start_x
             dy = event.y - start_y
-            img_x += dx
-            img_y += dy
-            canvas.coords(image_id, img_x, img_y)
+            offset_x += dx
+            offset_y += dy
+            constrain_offsets()
+            canvas.coords(image_id, offset_x, offset_y)
             start_x, start_y = event.x, event.y
 
     def stop_drag(event):
@@ -1006,15 +1031,20 @@ def crop_interactively(image_path):
         dragging = False
 
     def resize(scale):
-        nonlocal scale_factor, img_display_resized, img_tk, img_x, img_y
-        scale_factor *= scale
-        new_width = max(int(original_image.width * scale_factor * display_scale), 10)
-        new_height = max(int(original_image.height * scale_factor * display_scale), 10)
+        nonlocal zoom, img_display_resized, img_tk, offset_x, offset_y
+        old_zoom = zoom
+        zoom = max(min_zoom, zoom * scale)
+        # Keep the source point under the centre of the crop window stationary.
+        offset_x = display_width / 2 - (display_width / 2 - offset_x) * zoom / old_zoom
+        offset_y = display_height / 2 - (display_height / 2 - offset_y) * zoom / old_zoom
+        constrain_offsets()
+        new_width = round(original_image.width * zoom)
+        new_height = round(original_image.height * zoom)
         img_display_resized = original_image.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
         img_tk = ImageTk.PhotoImage(img_display_resized)
         canvas.itemconfig(image_id, image=img_tk)
         canvas.image = img_tk
-        canvas.coords(image_id, img_x, img_y)
+        canvas.coords(image_id, offset_x, offset_y)
 
     canvas.bind("<Button-1>", start_drag)
     canvas.bind("<B1-Motion>", drag)
@@ -1060,37 +1090,12 @@ def crop_interactively(image_path):
     if getattr(crop_window, "result", None) == "cancel":
         return None
 
-    current_width = int(original_image.width * scale_factor)
-    current_height = int(original_image.height * scale_factor)
-    frame_left = (current_width // 2) - int(img_x / display_scale)
-    frame_top = (current_height // 2) - int(img_y / display_scale)
-    orig_left = max(0, int(frame_left / scale_factor))
-    orig_top = max(0, int(frame_top / scale_factor))
-    orig_right = orig_left + int(actual_width / scale_factor)
-    orig_bottom = orig_top + int(actual_height / scale_factor)
-    orig_right = min(orig_right, original_image.width)
-    orig_bottom = min(orig_bottom, original_image.height)
-
-    crop_coords = (orig_left, orig_top, orig_right, orig_bottom)
+    crop_coords = calculate_crop_rectangle(
+        original_image.size, zoom, offset_x, offset_y,
+        (display_width, display_height),
+    )
     logging.info(f"Координаты обрезки: {crop_coords}")
-    cropped_image = original_image.crop(crop_coords)
-
-    scaled_width = cropped_image.width
-    scaled_height = cropped_image.height
-    target_ratio = 3 / 4
-    current_ratio = scaled_width / scaled_height
-    if current_ratio > target_ratio:
-        scaled_width = int(scaled_height * target_ratio)
-    else:
-        scaled_height = int(scaled_width / target_ratio)
-    scaled_image = cropped_image.resize((scaled_width, scaled_height), PILImage.Resampling.LANCZOS)
-
-    final_image = PILImage.new("RGB", (scaled_width, scaled_height), (255, 255, 255))
-    paste_x = int(img_x / display_scale)
-    paste_y = int(img_y / display_scale)
-    paste_x = max(0, min(paste_x, scaled_width - scaled_width))
-    paste_y = max(0, min(paste_y, scaled_height - scaled_height))
-    final_image.paste(scaled_image, (paste_x, paste_y))
+    final_image = original_image.crop(crop_coords)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     temp_path = os.path.join(SAVE_DIR, f"cropped_temp_{timestamp}.jpg")
