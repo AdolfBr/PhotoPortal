@@ -44,6 +44,10 @@ logging.info('Программа запущена')
 root = None
 cap = None
 webcam_label = None
+webcam_after_id = None
+app_closing = False
+last_webcam_read_error_log_time = None
+WEBCAM_READ_ERROR_LOG_INTERVAL = 5.0
 BG = "#F5F5E6"
 SAVE_DIR = appdata_local
 ICO_DIR = "C:\Program Files\PhotoPortal\icon.ico"
@@ -321,76 +325,106 @@ SAVE_DIR, camera_index, ICO_DIR, MIRROR_HORIZONTAL = load_settings()
 def show_webcam():
     """Отображение изображения с камеры"""
     global cap, webcam_label, MIRROR_HORIZONTAL, SENSITIVITY_THRESHOLD
+    global webcam_after_id, last_webcam_read_error_log_time
+
+    # Запланированный callback уже начал выполняться, поэтому его ID больше
+    # нельзя отменить через after_cancel().
+    webcam_after_id = None
+    if app_closing:
+        return
     if cap is None:
         logging.warning("Камера не инициализирована")
         return
     ret, frame = cap.read()
+    if not ret or frame is None:
+        current_time = time.monotonic()
+        if (last_webcam_read_error_log_time is None or
+                current_time - last_webcam_read_error_log_time >= WEBCAM_READ_ERROR_LOG_INTERVAL):
+            logging.error("Не удалось получить кадр с камеры")
+            last_webcam_read_error_log_time = current_time
+        schedule_webcam_update()
+        return
+
     if MIRROR_HORIZONTAL:
         frame = cv2.flip(frame, 1)
-    if ret:
-        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        mean_brightness = np.mean(frame_gray)
-        text_lines = None
-        if mean_brightness < 70:
-            text_lines = ["Слишком темно!", "Увеличьте освещение."]
-        elif mean_brightness > 200:
-            text_lines = ["Слишком ярко за спиной!", "Поробуйте сменить ракурс"]
+    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_brightness = np.mean(frame_gray)
+    text_lines = None
+    if mean_brightness < 70:
+        text_lines = ["Слишком темно!", "Увеличьте освещение."]
+    elif mean_brightness > 200:
+        text_lines = ["Слишком ярко за спиной!", "Поробуйте сменить ракурс"]
 
-        height, width = frame.shape[:2]
-        target_width = int(height * 3 / 4)
-        if width > target_width:
-            left = (width - target_width) // 2
-            frame = frame[:, left:left + target_width]
-        frame_small = cv2.resize(frame, (320, 240))
-        frame_rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+    height, width = frame.shape[:2]
+    target_width = int(height * 3 / 4)
+    if width > target_width:
+        left = (width - target_width) // 2
+        frame = frame[:, left:left + target_width]
+    frame_small = cv2.resize(frame, (320, 240))
+    frame_rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
 
-        results = selfie_segmentation.process(frame_rgb)
-        mask = results.segmentation_mask > SENSITIVITY_THRESHOLD
-        mask = mask.astype(np.uint8) * 255
-        kernel = np.ones((3, 3), np.uint8)
-        mask_dilated = cv2.dilate(mask, kernel, iterations=1)
-        mask_eroded = cv2.erode(mask_dilated, kernel, iterations=1)
-        mask_smoothed = cv2.GaussianBlur(mask_eroded, (3, 3), sigmaX=1.5, sigmaY=1.5)
-        _, mask_smoothed = cv2.threshold(mask_smoothed, 127, 255, cv2.THRESH_BINARY)
-        frame_rgb[mask_smoothed == 0] = [255, 255, 255]
+    results = selfie_segmentation.process(frame_rgb)
+    mask = results.segmentation_mask > SENSITIVITY_THRESHOLD
+    mask = mask.astype(np.uint8) * 255
+    kernel = np.ones((3, 3), np.uint8)
+    mask_dilated = cv2.dilate(mask, kernel, iterations=1)
+    mask_eroded = cv2.erode(mask_dilated, kernel, iterations=1)
+    mask_smoothed = cv2.GaussianBlur(mask_eroded, (3, 3), sigmaX=1.5, sigmaY=1.5)
+    _, mask_smoothed = cv2.threshold(mask_smoothed, 127, 255, cv2.THRESH_BINARY)
+    frame_rgb[mask_smoothed == 0] = [255, 255, 255]
 
-        frame_rgb = cv2.resize(frame_rgb, (300, 400), interpolation=cv2.INTER_LANCZOS4)
-        frame_pil = PILImage.fromarray(frame_rgb)
+    frame_rgb = cv2.resize(frame_rgb, (300, 400), interpolation=cv2.INTER_LANCZOS4)
+    frame_pil = PILImage.fromarray(frame_rgb)
 
-        if text_lines:
-            draw = ImageDraw.Draw(frame_pil)
-            try:
-                font = ImageFont.truetype("arial.ttf", 20)
-            except IOError:
-                font = ImageFont.load_default()
-            line_heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] for
-                            line in text_lines]
-            line_widths = [draw.textbbox((0, 0), line, font=font)[2] - draw.textbbox((0, 0), line, font=font)[0] for
-                           line in text_lines]
-            total_height = sum(line_heights)
-            max_width = max(line_widths)
-            frame_width, frame_height = 300, 400
-            start_y = (frame_height - total_height) // 2
-            current_y = start_y
-            for line, line_width, line_height in zip(text_lines, line_widths, line_heights):
-                text_x = (frame_width - line_width) // 2
-                draw.text((text_x, current_y), line, fill=(255, 0, 0), font=font)
-                current_y += line_height
+    if text_lines:
+        draw = ImageDraw.Draw(frame_pil)
+        try:
+            font = ImageFont.truetype("arial.ttf", 20)
+        except IOError:
+            font = ImageFont.load_default()
+        line_heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] for
+                        line in text_lines]
+        line_widths = [draw.textbbox((0, 0), line, font=font)[2] - draw.textbbox((0, 0), line, font=font)[0] for
+                       line in text_lines]
+        total_height = sum(line_heights)
+        frame_width, frame_height = 300, 400
+        start_y = (frame_height - total_height) // 2
+        current_y = start_y
+        for line, line_width, line_height in zip(text_lines, line_widths, line_heights):
+            text_x = (frame_width - line_width) // 2
+            draw.text((text_x, current_y), line, fill=(255, 0, 0), font=font)
+            current_y += line_height
 
-        frame_tk = ImageTk.PhotoImage(frame_pil)
-        webcam_label.config(image=frame_tk)
-        webcam_label.image = frame_tk
-        webcam_label.after(33, show_webcam)
-    else:
-        logging.error("Не удалось получить кадр с камеры")
+    frame_tk = ImageTk.PhotoImage(frame_pil)
+    webcam_label.config(image=frame_tk)
+    webcam_label.image = frame_tk
+    schedule_webcam_update()
+
+
+def schedule_webcam_update():
+    """Планирует единственное следующее обновление изображения с камеры."""
+    global webcam_after_id
+    if not app_closing and webcam_label is not None:
+        webcam_after_id = webcam_label.after(33, show_webcam)
 
 
 def update_camera(index):
     """Подключение к камере"""
-    global cap
+    global cap, webcam_after_id
     logging.info(f"Переключение на камеру {index}")
+    if webcam_after_id is not None:
+        try:
+            webcam_label.after_cancel(webcam_after_id)
+        except tk.TclError:
+            logging.debug("Callback камеры уже был удалён")
+        finally:
+            webcam_after_id = None
+
     if cap is not None:
         cap.release()
+    if app_closing:
+        cap = None
+        return
     cap = cv2.VideoCapture(index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
@@ -618,6 +652,10 @@ def capture_photo():
     logging.info("Начало съёмки фото")
     if cap and cap.isOpened():
         ret, frame = cap.read()
+        if not ret or frame is None:
+            logging.error("Не удалось захватить кадр с камеры")
+            messagebox.showerror("Ошибка", "Не удалось сделать фото")
+            return
         if MIRROR_HORIZONTAL:
             frame = cv2.flip(frame, 1)
         if ret:
@@ -900,7 +938,8 @@ def crop_interactively(image_path):
 
 
 def main():
-    global root, webcam_label
+    global root, webcam_label, app_closing
+    app_closing = False
     logging.info("Запуск основного интерфейса")
     root = tk.Tk()
     logging.info("Главное окно Tkinter создано")
@@ -918,6 +957,7 @@ def main():
     root.geometry("800x750")
     root.resizable(False, False)
     root.configure(bg="#F5F5E6")
+    root.protocol("WM_DELETE_WINDOW", close_application)
     logging.info("Параметры окна установлены")
 
     webcam_frame = tk.Frame(root, bd=1, bg="#C39367")
@@ -972,9 +1012,26 @@ def main():
     try:
         root.mainloop()
     finally:
-        if cap:
-            cap.release()
-            logging.info("Камера освобождена")
+        close_application(destroy_root=False)
+
+
+def close_application(destroy_root=True):
+    """Останавливает callback камеры и освобождает её перед завершением."""
+    global app_closing, webcam_after_id, cap
+    app_closing = True
+    if webcam_after_id is not None and webcam_label is not None:
+        try:
+            webcam_label.after_cancel(webcam_after_id)
+        except tk.TclError:
+            logging.debug("Callback камеры уже был удалён при завершении")
+        finally:
+            webcam_after_id = None
+    if cap is not None:
+        cap.release()
+        cap = None
+        logging.info("Камера освобождена")
+    if destroy_root and root is not None:
+        root.destroy()
 
 
 
