@@ -2,6 +2,8 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from camera_selection import select_camera_id
+
 try:
     import sys
     import random
@@ -122,6 +124,12 @@ def load_settings():
     config.read(config_path)
     SAVE_DIR = config.get("Settings", "SaveDir", fallback=appdata_local)
     camera_index = config.getint("Settings", "CameraIndex", fallback=0)
+    cameras = get_available_cameras()
+    selected_camera_id = select_camera_id(
+        [camera["id"] for camera in cameras], camera_index
+    )
+    if selected_camera_id is not None:
+        camera_index = selected_camera_id
     ICO_DIR = config.get("Settings", "IcoDir", fallback=r"C:\Program Files\PhotoPortal\icon.ico")
     MIRROR_HORIZONTAL = config.getboolean("Settings", "MirrorHorizontal", fallback=False)
     NUM_THREADS = config.getint("Settings", "NumThreads", fallback=MAX_THREADS)
@@ -155,9 +163,6 @@ def save_settings(save_dir, camera_index, ICO_DIR, mirror_horizontal, num_thread
     with open(config_path, "w") as configfile:
         config.write(configfile)
     logging.info("Настройки успешно сохранены")
-
-
-SAVE_DIR, camera_index, ICO_DIR, MIRROR_HORIZONTAL = load_settings()
 
 
 def open_settings():
@@ -203,10 +208,19 @@ def open_settings():
     tk.Label(camera_frame, text="Камера", fg="#623B2A", bg=BG, font=("Arial", 12, "bold")).pack(anchor="w", padx=5,
                                                                                                 pady=2)
     cameras = get_available_cameras()
-    camera_combobox = ttk.Combobox(camera_frame, values=cameras, width=20)
+    camera_names = [camera["name"] for camera in cameras]
+    camera_combobox = ttk.Combobox(camera_frame, values=camera_names, width=20)
     camera_combobox.pack(anchor="w", padx=5, pady=2)
     if cameras:
-        camera_combobox.current(min(camera_index, len(cameras) - 1))
+        selected_camera_id = select_camera_id(
+            [camera["id"] for camera in cameras], camera_index
+        )
+        selected_position = next(
+            position
+            for position, camera in enumerate(cameras)
+            if camera["id"] == selected_camera_id
+        )
+        camera_combobox.current(selected_position)
     else:
         logging.warning("Не найдено доступных камер")
         messagebox.showwarning("Предупреждение", "Не найдено доступных камер.")
@@ -260,8 +274,13 @@ def open_settings():
     advanced_label.bind("<Button-1>", lambda e: toggle_advanced())
 
     def apply_settings():
-        global SAVE_DIR, ICO_DIR, MIRROR_HORIZONTAL, NUM_THREADS
-        selected_index = camera_combobox.current()
+        global SAVE_DIR, camera_index, ICO_DIR, MIRROR_HORIZONTAL, NUM_THREADS
+        selected_position = camera_combobox.current()
+        selected_camera_id = (
+            cameras[selected_position]["id"]
+            if cameras and selected_position >= 0
+            else None
+        )
         MIRROR_HORIZONTAL = mirror_var.get()
         NUM_THREADS = int(threads_combobox.get())
         os.environ["OMP_NUM_THREADS"] = str(NUM_THREADS)
@@ -269,11 +288,15 @@ def open_settings():
         os.environ["NUMEXPR_NUM_THREADS"] = str(NUM_THREADS)
         os.environ["OPENBLAS_NUM_THREADS"] = str(NUM_THREADS)
         cv2.setNumThreads(NUM_THREADS)
-        save_settings(SAVE_DIR, selected_index if cameras else 0, ICO_DIR, MIRROR_HORIZONTAL, NUM_THREADS)
+        if selected_camera_id is not None:
+            camera_index = selected_camera_id
+        save_settings(
+            SAVE_DIR, camera_index, ICO_DIR, MIRROR_HORIZONTAL, NUM_THREADS
+        )
         messagebox.showinfo("Успех", "Настройки сохранены!")
         settings_window.destroy()
-        if selected_index is not None and cameras:
-            update_camera(selected_index)
+        if selected_camera_id is not None:
+            update_camera(selected_camera_id)
         else:
             logging.warning("Не выбрана камера или камеры отсутствуют")
             messagebox.showwarning("Предупреждение", "Камера не выбрана или отсутствует.")
@@ -286,10 +309,13 @@ def get_available_cameras():
     for i in range(10):
         temp_cap = cv2.VideoCapture(i)
         if temp_cap.isOpened():
-            cameras.append(f"Камера {i}")
+            cameras.append({"id": i, "name": f"Камера {i}"})
             temp_cap.release()
     logging.info(f"Доступные камеры: {cameras}")
     return cameras
+
+
+SAVE_DIR, camera_index, ICO_DIR, MIRROR_HORIZONTAL = load_settings()
 
 
 def show_webcam():
