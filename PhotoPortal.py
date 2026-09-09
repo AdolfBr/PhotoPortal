@@ -116,6 +116,62 @@ def remove_temp_file(path):
 initialize_temp_directory()
 
 
+class PhotoStorage:
+    """Atomically save finished JPEG files in a configured directory."""
+
+    def __init__(self, save_dir, error_reporter=None):
+        self.save_dir = os.path.abspath(os.fspath(save_dir))
+        self.error_reporter = error_reporter or messagebox.showerror
+
+    def save(self, image):
+        """Save *image* and return its final path, or ``None`` on an I/O error."""
+        staging_path = None
+        try:
+            os.makedirs(self.save_dir, exist_ok=True)
+            if not os.access(self.save_dir, os.W_OK):
+                raise PermissionError(
+                    f"Нет доступа на запись в каталог: {self.save_dir}"
+                )
+
+            # Keep millisecond precision while retaining the requested timestamp
+            # format (the final three digits are microseconds below a millisecond).
+            timestamp = datetime.now().strftime("photo_%Y%m%d_%H%M%S_%f")[:-3]
+            final_path = os.path.join(self.save_dir, f"{timestamp}.jpg")
+            temporary_file = tempfile.NamedTemporaryFile(
+                prefix=".photoportal_", suffix=".tmp", dir=self.save_dir,
+                delete=False,
+            )
+            staging_path = temporary_file.name
+            temporary_file.close()
+
+            image.save(staging_path, "JPEG", quality=95, dpi=(300, 300))
+            os.replace(staging_path, final_path)
+            staging_path = None
+            logging.info("Изображение сохранено: %s", final_path)
+            return final_path
+        except PermissionError:
+            logging.exception("Нет доступа для сохранения фотографии в %s", self.save_dir)
+            self.error_reporter(
+                "Ошибка сохранения", "Нет доступа к выбранной папке."
+            )
+        except OSError:
+            logging.exception("Не удалось сохранить фотографию в %s", self.save_dir)
+            self.error_reporter(
+                "Ошибка сохранения", "Не удалось сохранить фотографию."
+            )
+        finally:
+            if staging_path:
+                try:
+                    os.remove(staging_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logging.exception(
+                        "Не удалось удалить временный файл: %s", staging_path
+                    )
+        return None
+
+
 class CameraManager:
     """Owns camera discovery and the complete ``VideoCapture`` lifecycle."""
 
@@ -809,8 +865,8 @@ def adjust_brightness(processor, from_webcam=False):
 
     def save():
         final_image = processor.resize(adjusted_image[0], 600, 800)
-        save_image(final_image, brightness_window)
-        result[0] = "saved"
+        if save_image(final_image, brightness_window):
+            result[0] = "saved"
 
     def retry():
         brightness_window.destroy()
@@ -835,28 +891,32 @@ def adjust_brightness(processor, from_webcam=False):
 
 
 def save_image(image, result_window):
-    """Сохраняет обработанное изображение и обновляет статистику."""
+    """Сохраняет изображение, затем выполняет необязательные действия."""
     logging.info("Начало сохранения изображения")
-    index = 1
-    while os.path.exists(save_path := os.path.join(SAVE_DIR, f"photo_{index}.jpg")):
-        index += 1
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    staging_path = create_temp_path(".jpg")
+    save_path = PhotoStorage(SAVE_DIR).save(image)
+    if not save_path:
+        return None
+
+    # A successfully written photo stays successful even when any follow-up
+    # operation is unavailable. Always close the result window in that case.
     try:
-        image.save(staging_path, "JPEG", quality=95, dpi=(300, 300))
-        os.replace(staging_path, save_path)
+        try:
+            update_local_daily_stats()
+        except Exception:
+            logging.exception("Не удалось обновить локальную статистику")
+
+        try:
+            executor.submit(_sync_network_stats_safely)
+        except Exception:
+            logging.exception("Не удалось запустить сетевую синхронизацию")
+
+        try:
+            os.startfile(SAVE_DIR)
+        except (AttributeError, OSError):
+            logging.exception("Не удалось открыть каталог сохранения: %s", SAVE_DIR)
     finally:
-        remove_temp_file(staging_path)
-    logging.info(f"Изображение сохранено: {save_path}")
-
-    # Обновляем локальную статистику по дням
-    update_local_daily_stats()
-
-    # Запускаем синхронизацию в фоновом потоке
-    executor.submit(sync_network_stats)
-
-    os.startfile(SAVE_DIR)
-    result_window.destroy()
+        result_window.destroy()
+    return save_path
 
 
 def capture_photo():
@@ -915,6 +975,14 @@ def capture_and_process_photo():
         return None
     finally:
         remove_temp_file(photo_path)
+
+def _sync_network_stats_safely():
+    """Run network synchronization without leaking worker exceptions."""
+    try:
+        sync_network_stats()
+    except Exception:
+        logging.exception("Ошибка при сетевой синхронизации статистики")
+
 
 def sync_network_stats():
     """Синхронизирует локальную статистику с сетевым файлом за последние 30 дней."""
@@ -985,8 +1053,8 @@ def sync_network_stats():
                 f.write(f"{date},{count}\n")
         logging.info(f"Статистика синхронизирована для {hostname} за последние 30 дней")
 
-    except Exception as e:
-        logging.error(f"Ошибка при синхронизации статистики: {e}")
+    except Exception:
+        logging.exception("Ошибка при синхронизации статистики")
 
 def update_local_daily_stats():
     """Обновляет локальный файл ежедневной статистики."""
