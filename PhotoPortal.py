@@ -1,4 +1,17 @@
 import os
+
+# Numerical libraries inspect these variables while they are being imported.
+# Keep the conservative default here, before importing NumPy/OpenCV (directly or
+# through another application module).
+DEFAULT_NUM_THREADS = min(4, os.cpu_count() or 1)
+for _thread_variable in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+):
+    os.environ[_thread_variable] = str(DEFAULT_NUM_THREADS)
+
 import tempfile
 import threading
 import tkinter as tk
@@ -63,10 +76,107 @@ SAVE_DIR = appdata_local
 TEMP_DIR = os.path.join(appdata_local, "PhotoPortal", "Temp")
 ICO_DIR = r"C:\Program Files\PhotoPortal\icon.ico"
 MIRROR_HORIZONTAL = False
-NUM_THREADS = 4
-MAX_THREADS = 4
+NUM_THREADS = DEFAULT_NUM_THREADS
+MAX_THREADS = os.cpu_count() or 1
 SENSITIVITY_THRESHOLD = 0.6
 BLUR_STRENGTH = 5.5
+
+
+class AppConfig:
+    """Validated, fault-tolerant application configuration."""
+
+    SaveDir = appdata_local
+    CameraIndex = 0
+    IcoDir = r"C:\Program Files\PhotoPortal\icon.ico"
+    MirrorHorizontal = False
+    NumThreads = DEFAULT_NUM_THREADS
+    Sensitivity = 0.6
+    BlurStrength = 5.5
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(appdata_local, "PhotoPortal_config.ini")
+        for name in self._field_names():
+            setattr(self, name, getattr(type(self), name))
+
+    @staticmethod
+    def _field_names():
+        return (
+            "SaveDir", "CameraIndex", "IcoDir", "MirrorHorizontal",
+            "NumThreads", "Sensitivity", "BlurStrength",
+        )
+
+    def _read_value(self, section, name, converter, validator):
+        try:
+            value = converter(section[name])
+            if not validator(value):
+                raise ValueError(f"недопустимое значение {value!r}")
+            setattr(self, name, value)
+        except (KeyError, ValueError, configparser.Error) as error:
+            logging.warning(
+                "Некорректная настройка %s; используется default %r: %s",
+                name, getattr(self, name), error,
+            )
+
+    def load(self):
+        """Load every valid field, retaining only that field's default on error."""
+        parser = configparser.ConfigParser()
+        try:
+            with open(self.path, "r", encoding="utf-8") as config_file:
+                parser.read_file(config_file)
+            if not parser.has_section("Settings"):
+                logging.warning(
+                    "В конфигурационном файле %s отсутствует [Settings]; "
+                    "используются defaults", self.path,
+                )
+                return self
+        except FileNotFoundError:
+            logging.info("Конфигурационный файл %s не найден; используются defaults", self.path)
+            return self
+        except (configparser.Error, OSError, ValueError) as error:
+            logging.warning(
+                "Не удалось прочитать конфигурацию %s; используются defaults: %s",
+                self.path, error,
+            )
+            return self
+
+        section = parser["Settings"]
+        cpu_limit = os.cpu_count() or 1
+        self._read_value(section, "SaveDir", os.fspath, lambda value: bool(value.strip()))
+        self._read_value(section, "CameraIndex", int, lambda value: value >= 0)
+        self._read_value(section, "IcoDir", os.fspath, lambda value: bool(value.strip()))
+        self._read_value(
+            section, "MirrorHorizontal",
+            lambda value: parser.BOOLEAN_STATES[value.lower()],
+            lambda value: isinstance(value, bool),
+        )
+        self._read_value(section, "NumThreads", int, lambda value: 1 <= value <= cpu_limit)
+        self._read_value(section, "Sensitivity", float, lambda value: 0.1 <= value <= 0.9)
+        self._read_value(section, "BlurStrength", float, lambda value: 0 <= value <= 10)
+        return self
+
+    def save(self):
+        """Atomically replace the INI, leaving an existing file intact on error."""
+        parser = configparser.ConfigParser()
+        parser["Settings"] = {
+            name: str(getattr(self, name)) for name in self._field_names()
+        }
+        temporary_path = self.path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+            with open(temporary_path, "w", encoding="utf-8") as config_file:
+                parser.write(config_file)
+            os.replace(temporary_path, self.path)
+            logging.info("Настройки успешно сохранены в %s", self.path)
+            return True
+        except (configparser.Error, OSError, ValueError):
+            logging.exception("Не удалось сохранить настройки в %s", self.path)
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.exception("Не удалось удалить временный файл %s", temporary_path)
+            return False
 
 
 def initialize_temp_directory():
@@ -408,44 +518,27 @@ class Tooltip:
 def load_settings():
     """Загрузка настроек из конфигурационного файла или создание нового"""
     global SAVE_DIR, ICO_DIR, MIRROR_HORIZONTAL, NUM_THREADS, MAX_THREADS
+    global SENSITIVITY_THRESHOLD, BLUR_STRENGTH
     logging.info("Начало загрузки настроек")
-    config = configparser.ConfigParser()
-    config_path = os.path.join(appdata_local, "PhotoPortal_config.ini")
-
-    MAX_THREADS = multiprocessing.cpu_count()
+    MAX_THREADS = os.cpu_count() or 1
     logging.info(f"Обнаружено ядер: {MAX_THREADS}")
+    settings = AppConfig().load()
+    if not os.path.exists(settings.path):
+        settings.save()
 
-    if not os.path.exists(config_path):
-        logging.info("Конфигурационный файл не найден, создание нового")
-        config["Settings"] = {
-            "SaveDir": SAVE_DIR,
-            "IcoDir": ICO_DIR,
-            "CameraIndex": "0",
-            "MirrorHorizontal": "False",
-            "NumThreads": str(MAX_THREADS)
-        }
-        with open(config_path, "w") as configfile:
-            config.write(configfile)
-        logging.info("Создан новый конфигурационный файл")
-
-    config.read(config_path)
-    SAVE_DIR = config.get("Settings", "SaveDir", fallback=appdata_local)
-    camera_index = config.getint("Settings", "CameraIndex", fallback=0)
+    SAVE_DIR = settings.SaveDir
+    camera_index = settings.CameraIndex
     cameras = get_available_cameras()
     selected_camera_id = select_camera_id(
         [camera["id"] for camera in cameras], camera_index
     )
     if selected_camera_id is not None:
         camera_index = selected_camera_id
-    ICO_DIR = config.get("Settings", "IcoDir", fallback=r"C:\Program Files\PhotoPortal\icon.ico")
-    MIRROR_HORIZONTAL = config.getboolean("Settings", "MirrorHorizontal", fallback=False)
-    NUM_THREADS = config.getint("Settings", "NumThreads", fallback=MAX_THREADS)
-
-    NUM_THREADS = min(NUM_THREADS, MAX_THREADS)
-    os.environ["OMP_NUM_THREADS"] = str(NUM_THREADS)
-    os.environ["MKL_NUM_THREADS"] = str(NUM_THREADS)
-    os.environ["NUMEXPR_NUM_THREADS"] = str(NUM_THREADS)
-    os.environ["OPENBLAS_NUM_THREADS"] = str(NUM_THREADS)
+    ICO_DIR = settings.IcoDir
+    MIRROR_HORIZONTAL = settings.MirrorHorizontal
+    NUM_THREADS = settings.NumThreads
+    SENSITIVITY_THRESHOLD = settings.Sensitivity
+    BLUR_STRENGTH = settings.BlurStrength
     cv2.setNumThreads(NUM_THREADS)
 
     logging.info(
@@ -457,19 +550,15 @@ def save_settings(save_dir, camera_index, ICO_DIR, mirror_horizontal, num_thread
     """Сохранение настроек в конфигурационный файл"""
     logging.info(
         f"Сохранение настроек: SaveDir={save_dir}, CameraIndex={camera_index}, IcoDir={ICO_DIR}, MirrorHorizontal={mirror_horizontal}, NumThreads={num_threads}")
-    config = configparser.ConfigParser()
-    config["Settings"] = {
-        "SaveDir": save_dir,
-        "CameraIndex": str(camera_index),
-        "IcoDir": ICO_DIR,
-        "MirrorHorizontal": str(mirror_horizontal),
-        "NumThreads": str(num_threads)
-    }
-    config_path = os.path.join(appdata_local, "PhotoPortal_config.ini")
-
-    with open(config_path, "w") as configfile:
-        config.write(configfile)
-    logging.info("Настройки успешно сохранены")
+    settings = AppConfig()
+    settings.SaveDir = save_dir
+    settings.CameraIndex = camera_index
+    settings.IcoDir = ICO_DIR
+    settings.MirrorHorizontal = mirror_horizontal
+    settings.NumThreads = num_threads
+    settings.Sensitivity = SENSITIVITY_THRESHOLD
+    settings.BlurStrength = BLUR_STRENGTH
+    return settings.save()
 
 
 def open_settings():
@@ -590,10 +679,6 @@ def open_settings():
         )
         MIRROR_HORIZONTAL = mirror_var.get()
         NUM_THREADS = int(threads_combobox.get())
-        os.environ["OMP_NUM_THREADS"] = str(NUM_THREADS)
-        os.environ["MKL_NUM_THREADS"] = str(NUM_THREADS)
-        os.environ["NUMEXPR_NUM_THREADS"] = str(NUM_THREADS)
-        os.environ["OPENBLAS_NUM_THREADS"] = str(NUM_THREADS)
         cv2.setNumThreads(NUM_THREADS)
         if selected_camera_id is not None:
             camera_index = selected_camera_id
