@@ -82,6 +82,22 @@ SENSITIVITY_THRESHOLD = 0.6
 BLUR_STRENGTH = 5.5
 
 
+def set_window_icon(window):
+    """Best-effort application icon setup for a Tk window."""
+    if not ICO_DIR:
+        logging.warning("Путь к иконке не задан")
+        return
+
+    try:
+        if not os.path.exists(ICO_DIR):
+            logging.warning("Иконка не найдена по пути: %s", ICO_DIR)
+            return
+        window.iconbitmap(ICO_DIR)
+        logging.info("Иконка установлена: %s", ICO_DIR)
+    except (OSError, TypeError, ValueError, tk.TclError):
+        logging.exception("Не удалось установить иконку окна: %s", ICO_DIR)
+
+
 class AppConfig:
     """Validated, fault-tolerant application configuration."""
 
@@ -566,7 +582,7 @@ def open_settings():
     logging.info("Открытие окна настроек")
     settings_window = tk.Toplevel()
     settings_window.title("Настройки")
-    settings_window.iconbitmap(ICO_DIR)
+    set_window_icon(settings_window)
     settings_window.geometry("400x600")
     settings_window.configure(bg=BG)
     settings_window.resizable(False, False)
@@ -893,7 +909,7 @@ def adjust_brightness(processor, from_webcam=False):
     logging.info("Открытие окна корректировки яркости и сглаживания")
     brightness_window = tk.Toplevel()
     brightness_window.title("Настройка яркости и сглаживания")
-    brightness_window.iconbitmap(ICO_DIR)
+    set_window_icon(brightness_window)
     brightness_window.configure(bg=BG)
     brightness_window.grab_set()
     brightness_window.attributes('-topmost', True)  # Дочернее окно поверх главного
@@ -1197,7 +1213,7 @@ def crop_interactively(image_path):
     logging.info(f"Открытие окна кадрирования для: {image_path}")
     crop_window = tk.Toplevel()
     crop_window.title("Кадрирование изображения")
-    crop_window.iconbitmap(ICO_DIR)
+    set_window_icon(crop_window)
     crop_window.configure(bg=BG)
     crop_window.grab_set()
     crop_window.attributes('-topmost', True)
@@ -1336,16 +1352,7 @@ def main():
     root.protocol("WM_DELETE_WINDOW", shutdown_app)
     logging.info("Главное окно Tkinter создано")
     root.title("Подготовка фото для портала Mos.ru")
-    try:
-        icon_path = ICO_DIR
-        logging.info(f"Путь к иконке: {icon_path}")
-        if os.path.exists(icon_path):
-            root.iconbitmap(icon_path)
-            logging.info("Иконка установлена")
-        else:
-            logging.warning(f"Иконка не найдена по пути: {icon_path}")
-    except Exception as e:
-        logging.error(f"Ошибка при установке иконки: {e}")
+    set_window_icon(root)
     root.geometry("800x750")
     root.resizable(False, False)
     root.configure(bg="#F5F5E6")
