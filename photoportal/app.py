@@ -14,6 +14,7 @@ from camera_selection import select_camera_id
 from .camera import CameraManager
 from .config import AppConfig
 from .image_processor import ImageProcessor
+from .segmentation import create_selfie_segmentation
 from .statistics import sync_network_stats, update_local_daily_stats
 from .storage import PhotoStorage, create_temp_path, initialize_temp_directory, remove_temp_file
 from .ui import Tooltip, crop_interactively
@@ -31,8 +32,7 @@ class PhotoPortalApp:
         if not os.path.exists(self.config.path): self.config.save()
         self.camera_manager = camera_manager or CameraManager()
         if segmentation_model is None:
-            import mediapipe as mp
-            segmentation_model = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=0)
+            segmentation_model = create_selfie_segmentation()
         self.segmentation_model = segmentation_model
         self.image_processor = ImageProcessor(segmentation_model, self.config.Sensitivity)
         self.storage = PhotoStorage(self.config.SaveDir)
