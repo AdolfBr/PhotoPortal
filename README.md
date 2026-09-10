@@ -95,6 +95,9 @@ python -m unittest discover -s tests -v
 - **`No module named cv2/PIL/mediapipe`** — выбран не тот интерпретатор либо не
   установлены зависимости. Проверьте `.venv` в строке состояния PyCharm и снова
   выполните `python -m pip install -r requirements.txt`.
+- **`module 'mediapipe' has no attribute 'solutions'`** — установлена версия
+  MediaPipe без совместимого Solutions API. Переустановите закреплённую версию:
+  `python -m pip install --force-reinstall -r requirements.txt`.
 - **Камера не найдена/не открывается** — закройте приложения, уже использующие
   камеру, и разрешите доступ в **Параметры Windows → Конфиденциальность и
   безопасность → Камера**.
